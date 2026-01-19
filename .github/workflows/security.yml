@@ -1,0 +1,160 @@
+name: security
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    - cron: "17 3 * * 1" # weekly
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  codeql:
+    name: CodeQL (SAST)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+      # For JS/TS, build-mode none is fine; we use stronger query suites
+        uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript
+          build-mode: none
+          queries: security-extended,security-and-quality
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+
+  dependency-review:
+    name: Dependency Review (PR only)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+
+  gitleaks:
+    name: Secrets Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+
+  semgrep:
+    name: Semgrep (SAST rules)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep scan
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: p/security-audit
+
+  build-and-guardrails:
+    name: Build + Extension Guardrails
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Use the repo’s Node version if it has .nvmrc or package.json engines.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      # Install in the safest way:
+      # - use lockfile (ci)
+      # - do NOT run postinstall scripts by default for untrusted repos
+      - name: Install deps (no scripts)
+        run: |
+          npm ci --ignore-scripts
+
+      # Optional: run audit against known vulnerabilities.
+      # For forks/untrusted repos, treat this as signal; it may be noisy.
+      - name: npm audit (high+)
+        run: |
+          npm audit --audit-level=high
+
+      # If the repo has lint/tests/build scripts, enable them:
+      - name: Lint (if present)
+        run: |
+          npm run -s lint || echo "No lint script"
+
+      - name: Test (if present)
+        run: |
+          npm test --silent || echo "No tests"
+
+      # Build the extension (adjust command if repo uses another script)
+      - name: Build (if present)
+        run: |
+          npm run -s build || echo "No build script"
+
+      # Guardrails: flag obviously risky patterns in extension code.
+      # Adjust paths (src/, dist/, build/) to match your repo.
+      - name: Extension guardrails (heuristics)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Find manifest and print it for visibility in CI logs
+          if [ -f "manifest.json" ]; then
+            echo "=== manifest.json ==="
+            cat manifest.json
+          elif [ -f "src/manifest.json" ]; then
+            echo "=== src/manifest.json ==="
+            cat src/manifest.json
+          else
+            echo "No manifest.json found at repo root or src/. Check paths."
+          fi
+
+          # Heuristic checks (not perfect):
+          # 1) Remote code indicators
+          # 2) Dangerous Node APIs in a browser extension bundle
+          # 3) Suspicious WASM/base64 blobs
+          echo "=== Heuristic grep ==="
+          grep -RIn --exclude-dir=node_modules --exclude=package-lock.json \
+            -e "eval(" \
+            -e "new Function" \
+            -e "atob(" \
+            -e "WebAssembly" \
+            -e "chrome\.scripting\.executeScript" \
+            -e "fetch\(" \
+            -e "XMLHttpRequest" \
+            -e "wss\?://" \
+            -e "stratum\+tcp" \
+            . || true
+
+          # 4) Block obvious “download and execute” patterns (more relevant if any Node tooling exists)
+          grep -RIn --exclude-dir=node_modules \
+            -e "child_process" \
+            -e "execSync" \
+            -e "spawn(" \
+            . || true
